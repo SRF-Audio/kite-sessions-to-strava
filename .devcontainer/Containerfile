@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+FROM python:latest
+
+# Avoid byte-code files and enable unbuffered logs
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+# Install build tools once for any wheels you need
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git curl wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user that VS Code will map to your host UID
+ARG USERNAME=vscode
+RUN useradd -m $USERNAME
+USER $USERNAME
+WORKDIR /workspace
+
+# Pre-install deps for cacheable layer (debugpy is the VS Code debugger)
+COPY requirements.txt /tmp/req.txt
+RUN pip install --user -r /tmp/req.txt debugpy
+
+# Copy the remainder of the source tree after deps are cached
+COPY --chown=$USERNAME:$USERNAME . /workspace
+
+ENV PATH="/home/$USERNAME/.local/bin:${PATH}"
