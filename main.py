@@ -5,6 +5,5 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 )
 
-if name == "__main__":
-    # test logging
-    logging.info("This is an info message.")
+if __name__ == "__main__":
+    logging.info("Kite Strava integration started.")

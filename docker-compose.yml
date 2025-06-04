@@ -1,0 +1,8 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kite-dev
+    tty: true
+    stdin_open: true
