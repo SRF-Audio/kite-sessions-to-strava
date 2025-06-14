@@ -3,6 +3,9 @@ import requests
 import time
 import os
 import sys
+import json
+from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -124,3 +127,39 @@ class StravaClient:
 
         logger.info("Total activities fetched: %d", len(activities))
         return activities
+
+    def save_activities_as_json(
+        self,
+        activities: list[dict],
+        output_dir: str | Path = "."
+    ) -> Path:
+        """
+        Persist a list of activity dictionaries to a timestamp-named, pretty-printed
+        JSON file.
+
+        Args:
+            activities: The iterable returned by ``get_logged_in_athlete_activities``.
+            output_dir: Directory in which to place the file (default: current dir).
+
+        Returns:
+            pathlib.Path pointing to the file that was written.
+
+        Raises:
+            OSError: If *output_dir* is not writable.
+        """
+        out_dir = Path(output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)   # ⇐ create ./outputs if absent
+
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        filename = f"strava_activities_{ts}.json"
+        path = out_dir / filename
+
+        logger.info("Writing %d activities to %s", len(activities), path)
+
+        with path.open("w", encoding="utf-8") as fp:
+            json.dump(activities, fp, ensure_ascii=False, indent=2)
+
+        logger.info("Successfully wrote activities JSON to %s (%.1f KB)",
+                    path, path.stat().st_size / 1024)
+        return path
+    
