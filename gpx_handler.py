@@ -60,7 +60,7 @@ class GPXHandler:
     def __len__(self) -> int:
         return self.total_gpx_files
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(directory='{self.directory}', "
             f"files={self.total_gpx_files})"
@@ -180,11 +180,46 @@ class GPXHandler:
         self.logger.info("GPX summary for %s:\n%s", Path(gpx_file).name, pretty)
         return summary
 
+    def display_unique_trkpt_properties(self, gpx_file: str | Path) -> Dict[str, Any]:
+        """Return a mapping of *extension* tag names to their occurrence counts.
+
+        Only counts child elements of ``<gpxtpx:TrackPointExtension>`` inside
+        each ``<trkpt>``. Useful for a quick glance at what extra data a file
+        carries (speed, hr, cadence, etc.).
+        """
+        path = Path(gpx_file).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+        tree = ET.parse(path)
+        root = tree.getroot()
+
+        counts: Dict[str, int] = {}
+        for ext in root.findall(".//g:trkpt/g:extensions/gpxtpx:TrackPointExtension", self._NS):
+            for child in ext:
+                tag_local = child.tag.split("}")[-1]  # Strip namespace URI
+                counts[tag_local] = counts.get(tag_local, 0) + 1
+
+        summary = {
+            "file_name": path.name,
+            "unique_extension_properties": counts,
+        }
+        pretty = pformat(summary, indent=2, compact=False, sort_dicts=False)
+        self.logger.info("Extension property counts for %s:%s", path.name, pretty)
+        return summary
+
     def display_all_gpx(self) -> List[Dict[str, Any]]:
-        """Iterate over all discovered GPX files and pretty‑print each summary."""
+        """Pretty‑print combined GPX + extension summaries for every file."""
 
         all_summaries: List[Dict[str, Any]] = []
         for path in self.gpx_files:
-            all_summaries.append(self.display_gpx(path))
-        self.logger.info("Displayed %d GPX summaries from '%s'.", len(all_summaries), self.directory)
+            base_summary = self.parse_gpx(path)
+            ext_summary = self.display_unique_trkpt_properties(path)["unique_extension_properties"]
+            base_summary["unique_extension_properties"] = ext_summary
+            self.logger.info(
+                "Full summary for %s:\n%s", path.name, pformat(base_summary, indent=2, sort_dicts=False)
+            )
+            all_summaries.append(base_summary)
+
+        self.logger.info("Displayed %d combined summaries from '%s'.", len(all_summaries), self.directory)
         return all_summaries

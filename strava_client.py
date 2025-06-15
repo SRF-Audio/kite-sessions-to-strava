@@ -92,7 +92,7 @@ class StravaClient:
 
         activities = []
         page = 1
-        per_page = 100  # Max allowed by Strava
+        per_page = 100
 
         while True:
             params = {
