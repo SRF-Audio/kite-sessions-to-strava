@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# Input/Output files
+./gpx_files/
+strava_activities_*.json
