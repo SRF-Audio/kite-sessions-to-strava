@@ -175,5 +175,5 @@ cython_debug/
 
 
 # Input/Output files
-./gpx_files/
+gpx_files/**
 strava_activities_*.json
