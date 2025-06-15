@@ -8,7 +8,7 @@ logging.basicConfig(
 # Import other modules here (after basicConfig so they inherit the config)
 import strava_client
 import gpx_handler
-
+from gpx_strava_reconciler import GPXStravaReconciler
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,9 @@ if __name__ == "__main__":
 
     gpx = gpx_handler.GPXHandler(gpx_path)
     gpx.display_all_gpx()
+
+    reconciler = GPXStravaReconciler(strava, gpx)
+    upload_jobs = reconciler.reconcile()
     # Use this block to call the API when needed
     # current_strava_activities = strava.get_logged_in_athlete_activities()
 
