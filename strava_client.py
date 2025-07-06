@@ -1,165 +1,201 @@
+"""Strava API convenience wrapper
+================================
+· OAuth2 refresh‑token flow
+· Read **and** write helpers (upload GPX → activity)
+
+The class focuses on:
+---------------------
+1. Handling token refresh transparently.
+2. Downloading all athlete activities (used by the reconciler).
+3. Uploading *GPX* files prepared by :pyclass:`GpxUploadJob`.
+
+References
+~~~~~~~~~~
+* Strava OAuth: <https://developers.strava.com/docs/getting-started/>
+* Uploads endpoint: <https://developers.strava.com/docs/uploads/>
+* Model "SportType": <https://developers.strava.com/docs/reference/#api-models-SportType>
+"""
+
+from __future__ import annotations
+
+import json
 import logging
-import requests
-import time
 import os
 import sys
-import json
+import time
 from pathlib import Path
-from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import requests
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+class StravaAuthError(RuntimeError):
+    """Raised when (re)authentication fails."""
+
+
+class StravaUploadError(RuntimeError):
+    """Raised when an upload returns a non‑success state."""
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 class StravaClient:
-    def __init__(self):
+    """Lightweight Strava API helper.
+
+    The client expects the following **environment variables** to be set:
+
+    * ``STRAVA_CLIENT_ID``
+    * ``STRAVA_CLIENT_SECRET``
+    * ``STRAVA_REFRESH_TOKEN``
+    """
+
+    BASE_URL = "https://www.strava.com/api/v3"
+    TOKEN_URL = "https://www.strava.com/oauth/token"
+
+    def __init__(self) -> None:
         self.client_id = os.getenv("STRAVA_CLIENT_ID")
         self.client_secret = os.getenv("STRAVA_CLIENT_SECRET")
         self.refresh_token = os.getenv("STRAVA_REFRESH_TOKEN")
-        self.access_token = None
-        self.expires_at = None  # Unix timestamp when token expires
-        self.base_url = "https://www.strava.com/api/v3"
 
         if not all([self.client_id, self.client_secret, self.refresh_token]):
             logger.error(
-                """Missing required Strava API credentials in environment.
-
-                    Expected environment variables:
-                        STRAVA_CLIENT_ID
-                        STRAVA_CLIENT_SECRET
-                        STRAVA_REFRESH_TOKEN
-
-                    Please set these and try again."""
+                "Missing Strava credentials. Ensure STRAVA_CLIENT_ID / _SECRET / _REFRESH_TOKEN are set."
             )
             sys.exit(1)
-        self.authenticate()
 
-    def authenticate(self):
-        """
-        Fully authenticate the session, using refresh_token flow.
-        On success:
-            - self.access_token is valid
-            - self.expires_at is set
-            - self.refresh_token is updated if rotated
-        """
-        token_url = "https://www.strava.com/oauth/token"
-        data = {
+        self.access_token: Optional[str] = None
+        self.expires_at: Optional[int] = None  # Unix ts
+
+        self._authenticate()
+
+    # ---------------------------------------------------------------------
+    # Authentication helpers
+    # ---------------------------------------------------------------------
+    def _authenticate(self) -> None:
+        """Refresh the access token (unconditionally)."""
+        payload = {
             "client_id": self.client_id,
             "client_secret": self.client_secret,
             "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token
+            "refresh_token": self.refresh_token,
         }
 
-        logger.info("Authenticating with Strava API using refresh_token...")
+        logger.info("Authenticating with Strava (refresh‑token flow)…")
 
         try:
-            response = requests.post(token_url, data=data, timeout=10)
-            response.raise_for_status()
-            token_data = response.json()
+            resp = requests.post(self.TOKEN_URL, data=payload, timeout=10)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            raise StravaAuthError(f"Token request failed: {exc}") from exc
 
-            # Extract token fields
-            self.access_token = token_data.get("access_token")
-            self.refresh_token = token_data.get("refresh_token")
-            self.expires_at = token_data.get("expires_at")
+        token_data = resp.json()
+        self.access_token = token_data["access_token"]
+        self.refresh_token = token_data["refresh_token"]  # might rotate
+        self.expires_at = token_data["expires_at"]
 
-            if not self.access_token or not self.expires_at:
-                logger.error(
-                    "Strava token response missing required fields: %s", token_data
-                )
-                raise RuntimeError("Incomplete token response from Strava.")
+        ttl = self.expires_at - int(time.time())
+        logger.info("Authentication OK – token valid for %.1f min", ttl / 60)
 
-            # Log success with readable expiry
-            expires_in_sec = self.expires_at - int(time.time())
-            logger.info(
-                "Strava authentication successful. Token expires in %d minutes.",
-                expires_in_sec // 60
-            )
+    # ---------------------------------------------------------------------
+    # Low‑level request helper
+    # ---------------------------------------------------------------------
+    def _req(self, method: str, path: str, **kw):
+        """Wrap *requests* with auto‑refresh + uniform error handling."""
+        # Refresh if token is within 30 s of expiry
+        if self.expires_at and time.time() > self.expires_at - 30:
+            self._authenticate()
 
-        except requests.exceptions.RequestException as e:
-            logger.error("Error during Strava authentication: %s", str(e))
+        kw.setdefault("timeout", 30)
+        kw.setdefault("headers", {})
+        kw["headers"].update({"Authorization": f"Bearer {self.access_token}"})
+
+        url = f"{self.BASE_URL}{path}"
+
+        try:
+            resp = requests.request(method, url, **kw)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            logger.error("Strava %s %s failed: %s", method, path, exc)
             raise
 
-        except Exception as e:
-            logger.exception("Unexpected error during Strava authentication.")
-            raise
-
-    def get_logged_in_athlete_activities(self):
-        """
-        Retrieve ALL athlete activities across ALL pages.
-        Returns a list of activity dicts.
-
-        NOTE: No filtering is done here — caller is responsible for any filtering.
-        """
-        logger.info("Fetching ALL athlete activities from Strava...")
-
-        activities = []
+    # ---------------------------------------------------------------------
+    # Public API – reads
+    # ---------------------------------------------------------------------
+    def get_logged_in_athlete_activities(self) -> List[Dict[str, Any]]:
+        """Fetch **all** activities (paged)."""
+        logger.info("Fetching ALL athlete activities…")
+        out: List[Dict[str, Any]] = []
         page = 1
-        per_page = 100
-
         while True:
-            params = {
-                "page": page,
-                "per_page": per_page
-            }
-
-            url = f"{self.base_url}/athlete/activities"
-
-            try:
-                response = requests.get(
-                    url,
-                    headers = {
-                        "Authorization": f"Bearer {self.access_token}"
-                    },
-                    params=params,
-                    timeout=10
-                )
-                response.raise_for_status()
-                page_activities = response.json()
-            except requests.exceptions.RequestException as e:
-                logger.error("Error fetching activities on page %d: %s", page, str(e))
-                raise
-
-            if not page_activities:
-                logger.info("No more activities found (page %d empty).", page)
+            params = {"page": page, "per_page": 100}
+            resp = self._req("GET", "/athlete/activities", params=params)
+            batch = resp.json()
+            if not batch:
                 break
-
-            logger.info("Fetched page %d with %d activities.", page, len(page_activities))
-            activities.extend(page_activities)
+            logger.info("Fetched page %d (%d activities)", page, len(batch))
+            out.extend(batch)
             page += 1
+        logger.info("Total activities fetched: %d", len(out))
+        return out
 
-        logger.info("Total activities fetched: %d", len(activities))
-        return activities
+    # ---------------------------------------------------------------------
+    # Public API – writes (uploads)
+    # ---------------------------------------------------------------------
+    def upload_gpx(self, job, *, dry_run: bool = False) -> Optional[Dict[str, Any]]:
+        """Upload a single :pyclass:`GpxUploadJob`.
 
-    def save_activities_as_json(
-        self,
-        activities: list[dict],
-        output_dir: str | Path = "."
-    ) -> Path:
+        Parameters
+        ----------
+        job:
+            Prepared job from the reconciler.
+        dry_run:
+            If *True*, **no request** is made; the payload is logged at INFO
+            level instead. This is handy for verifying the upload body.
         """
-        Persist a list of activity dictionaries to a timestamp-named, pretty-printed
-        JSON file.
+        if dry_run:
+            logger.info("DRY‑RUN — would POST /uploads with:\n%s",
+                        json.dumps(job.payload, indent=2, ensure_ascii=False))
+            return None
 
-        Args:
-            activities: The iterable returned by ``get_logged_in_athlete_activities``.
-            output_dir: Directory in which to place the file (default: current dir).
+        files = {
+            "file": (
+                job.gpx_path.name,
+                job.gpx_path.read_bytes(),
+                "application/gpx+xml",
+            )
+        }
+        resp = self._req("POST", "/uploads", data=job.payload, files=files)
+        data = resp.json()
+        logger.info("Upload accepted — upload_id=%s", data.get("id"))
+        return data
 
-        Returns:
-            pathlib.Path pointing to the file that was written.
+    # ---------------------------------------------------------------------
+    # Polling helper
+    # ---------------------------------------------------------------------
+    def poll_upload(self, upload_id: int, *, interval: int = 5, timeout: int = 180) -> int:
+        """Poll ``/uploads/{id}`` until it becomes an activity or fails.
 
-        Raises:
-            OSError: If *output_dir* is not writable.
+        Returns the new **activity_id** once available. Raises
+        :class:`StravaUploadError` on error or timeout.
         """
-        out_dir = Path(output_dir).expanduser().resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)   # ⇐ create ./outputs if absent
+        deadline = time.time() + timeout
+        path = f"/uploads/{upload_id}"
 
-        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-        filename = f"strava_activities_{ts}.json"
-        path = out_dir / filename
+        while time.time() < deadline:
+            time.sleep(interval)
+            data = self._req("GET", path).json()
+            status = data.get("status")
+            if status == "Your activity is ready.":
+                logger.info("Upload %s processed → activity_id=%s", upload_id, data["activity_id"])
+                return data["activity_id"]
+            if status and status.startswith("There was an error"):
+                raise StravaUploadError(data.get("error", "Unknown upload error"))
+            logger.debug("Upload %s status: %s", upload_id, status)
 
-        logger.info("Writing %d activities to %s", len(activities), path)
-
-        with path.open("w", encoding="utf-8") as fp:
-            json.dump(activities, fp, ensure_ascii=False, indent=2)
-
-        logger.info("Successfully wrote activities JSON to %s (%.1f KB)",
-                    path, path.stat().st_size / 1024)
-        return path
-    
+        raise StravaUploadError(f"Timed out waiting for upload {upload_id} to finish")
